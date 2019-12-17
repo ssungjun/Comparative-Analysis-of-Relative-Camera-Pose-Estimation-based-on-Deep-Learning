@@ -6,7 +6,8 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from network.build_net import build
 from util import *
-from data_loader_pose import *
+#from data_loader_pose import *
+from multi_data_loader_pose import *
 from argparser import give_parser
 from eval import eval
 from visualize import visualize
@@ -30,8 +31,8 @@ def train():
     args.train_sets = 'train'
     args.means = (104, 117, 123)
     datalist = pre_read_data(args)
-    dataset = PoseDetection(root=args.dataset_root, image_set='train', dataset_name=args.dataset, target_type=args.target_type, pose_type=args.pose_type, seven_scene_opt=args.seven_opt, data=datalist)
-    testset = PoseDetection(root=args.dataset_root, image_set='test', dataset_name=args.dataset, target_type=args.target_type, pose_type=args.pose_type, seven_scene_opt=args.seven_opt, data=datalist)
+    dataset = Multi_PoseDetection(root=args.dataset_root, image_set='train', dataset_name=args.dataset, target_type=args.target_type, pose_type=args.pose_type, seven_scene_opt=args.seven_opt, data=datalist)
+    testset = Multi_PoseDetection(root=args.dataset_root, image_set='test', dataset_name=args.dataset, target_type=args.target_type, pose_type=args.pose_type, seven_scene_opt=args.seven_opt, data=datalist)
     '''dataset = PoseDetection(root=args.dataset_root, image_set='train', dataset_name=args.dataset,
                             target_type='non_inv', pose_type=args.pose_type, seven_scene_opt=args.seven_opt,
                             data=datalist)
@@ -96,7 +97,7 @@ def train():
     if args.visdom:
         vis_title = args.net + '_' + args.dataset + '_' + args.pose_type
         if args.pose_type[0] == 'q':
-            vis_legend = ['Rotation Loss', 'Transport Loss', 'Rotation error', 'Transport error', 'Quaternion error']
+            vis_legend = ['Rotation Loss', 'Transport Loss', 'Rotation error', 'Transport error']
         elif args.pose_type[0] == 'd':
             vis_legend = ['Rotation Loss', 'Angle Loss', 'Transport Loss', 'Rotation error', 'Angle error', 'Transport error']
         train_plot = create_vis_plot('train', 'Loss', vis_title, vis_legend, viz)
@@ -124,68 +125,68 @@ def train():
             param.requires_grad = True
         batch_size = len(batch_iterator)
         for batch in tqdm(batch_iterator, desc='train iteration', mininterval=1):
+            #with torch.autograd.set_detect_anomaly(True):
             if args.pose_type[0] == 'd':
                 image1, image2, target1, target2, target3, idx = batch
             elif args.pose_type[0] == 'q':
-                image1, image2, target1, target2, idx = batch
+                image1, image2, image3, image4, image5, target1, target2, target3, target4, idx = batch
             if args.cuda:
                 image1 = Variable(image1.cuda())
                 image2 = Variable(image2.cuda())
+                image3 = Variable(image3.cuda())
+                image4 = Variable(image4.cuda())
+                image5 = Variable(image5.cuda())
                 target1 = Variable(target1.cuda())
                 target2 = Variable(target2.cuda())
+                target3 = Variable(target3.cuda())
+                target4 = Variable(target4.cuda())
                 if args.pose_type[0] == 'd':
                     target3 = Variable(target3.cuda())
             else:
                 image1 = Variable(image1)
                 image2 = Variable(image2)
+                image3 = Variable(image3)
+                image4 = Variable(image4)
+                image5 = Variable(image5)
                 target1 = Variable(target1)
                 target2 = Variable(target2)
+                target3 = Variable(target3)
+                target4 = Variable(target4)
                 if args.pose_type[0] == 'd':
                     target3 = Variable(target3)
             # forward
             net.zero_grad()
             optimizer.zero_grad()
-            out = net(image1, image2)
-            if args.pose_type[0] == 'd':
-                angle_err = float(torch.mean(torch.abs(target2 - out[1])).data.cpu())
-            elif args.pose_type[0] == 'q':
-                rot_pred = quaternion_to_rotation(out[0])
-                rot_gt = quaternion_to_rotation(target1)
-                angle_err = rotation_error(rot_pred, rot_gt)
-                quat_err = quaternion_error(out[0], target1)
+            if epoch < 50:
+                out = net(image1, image2, image3, image4, image5, phase=1)
+            else:
+                net.module.feature_resnet.requires_grad = False
+                net.module.feature_down.requires_grad = False
+                out = net(image1, image2, image3, image4, image5, phase=2)
+            angle_err = 0
+            tran_err = 0
+            target = [target1, target2, target3, target4]
+            for i in range(len(out)):
+                rot_pred = quaternion_to_rotation(out[i][:, :4])#quaternion_to_rotation(diff_quaternion_to_quat(out[0], args))
+                rot_gt = quaternion_to_rotation(target[i][:, :4])
+                angle_err += rotation_error(rot_pred, rot_gt) / 4
+                tran_err += float(torch.mean(F.pairwise_distance(diff_transport(target[i][:, 4:], args), out[i][:, 4:])).data.cpu()) / 4
             # backprop
-            if args.pose_type[0] == 'd':
-                loss_angle = von_loss(out[1], target2)
-                loss_rotation = mse_loss(5*out[0], 5*target1)
-                loss_transport = mse_loss(5*out[2], 5*target3)
-                #loss = loss_rotation + loss_transport + loss_angle
-                loss = torch.pow(loss_rotation*loss_transport*loss_angle, 1/3)
-            elif args.pose_type[0] == 'q':
-                '''if epoch < 10:
-                    loss_rotation = orientation_loss(target1, out[0], 'non')
-                else:
-                    loss_rotation = orientation_loss(target1, out[0], 'pow')'''
-                loss_rotation = mse_loss(out[0], target1)
-                loss_transport = mse_loss(out[1], target2)
-                loss = loss_rotation + loss_transport
+            loss_rotation, loss_transport = Loss_calculate(out, target)
+            loss = loss_rotation + loss_transport
 
             loss.backward()
             optimizer.step()
             rot_loss += loss_rotation.data / batch_size  # [0]
             trans_loss += loss_transport.data / batch_size  # [0]
-            if args.pose_type[0] == 'q':
-                rot_err += angle_err / batch_size
-                quat_total_err += quat_err / batch_size
-                trans_err += float(torch.mean(F.pairwise_distance(target2, out[1])).data.cpu()) / batch_size
-            elif args.pose_type[0] == 'd':
-                ang_loss += loss_angle.data / batch_size  # [0]
-                ang_err += angle_err / batch_size
-                rot_err += float(torch.mean(F.pairwise_distance(target1, out[0])).data.cpu()) / batch_size
-                trans_err += float(torch.mean(F.pairwise_distance(target3, out[2])).data.cpu()) / batch_size
+
+            rot_err += angle_err / batch_size
+            quat_total_err += quat_err / batch_size
+            trans_err += tran_err / batch_size
 
         if args.visdom:
             if args.pose_type[0] == 'q':
-                datas = [rot_loss, trans_loss, rot_err, trans_err, quat_total_err]
+                datas = [rot_loss, trans_loss, rot_err, trans_err]
             elif args.pose_type[0] == 'd':
                 datas = [rot_loss, ang_loss, trans_loss, rot_err, ang_err, trans_err]
             update_vis_plot(epoch, datas, train_plot, 'append', viz, epoch_size)
@@ -196,8 +197,7 @@ def train():
         rot_err = 0
         ang_err = 0
         trans_err = 0
-        quat_err = 0
-        quat_total_err = 0
+
 
         net.eval()
         batch_size = len(test_iterator)
@@ -207,54 +207,55 @@ def train():
             if args.pose_type[0] == 'd':
                 image1, image2, target1, target2, target3, idx = batch
             elif args.pose_type[0] == 'q':
-                image1, image2, target1, target2, idx = batch
+                image1, image2, image3, image4, image5, target1, target2, target3, target4, idx = batch
             if args.cuda:
                 image1 = Variable(image1.cuda())
                 image2 = Variable(image2.cuda())
+                image3 = Variable(image3.cuda())
+                image4 = Variable(image4.cuda())
+                image5 = Variable(image5.cuda())
                 target1 = Variable(target1.cuda())
                 target2 = Variable(target2.cuda())
+                target3 = Variable(target3.cuda())
+                target4 = Variable(target4.cuda())
                 if args.pose_type[0] == 'd':
                     target3 = Variable(target3.cuda())
             else:
                 image1 = Variable(image1)
                 image2 = Variable(image2)
+                image3 = Variable(image3)
+                image4 = Variable(image4)
+                image5 = Variable(image5)
                 target1 = Variable(target1)
                 target2 = Variable(target2)
+                target3 = Variable(target3)
+                target4 = Variable(target4)
                 if args.pose_type[0] == 'd':
                     target3 = Variable(target3)
             # forward
             net.zero_grad()
-            out = net(image1, image2)
-            if args.pose_type[0] == 'd':
-                angle_err = float(torch.mean(torch.abs(target2 - out[1])).data.cpu())
-            elif args.pose_type[0] == 'q':
-                rot_pred = quaternion_to_rotation(out[0])
-                rot_gt = quaternion_to_rotation(target1)
-                angle_err = rotation_error(rot_pred, rot_gt)
-                quat_err = quaternion_error(out[0],target1)
-            # backprop
-            if args.pose_type[0] == 'd':
-                loss_angle = von_loss(out[1], target2)
-                loss_rotation = mse_loss(5*out[0], 5*target1)
-                loss_transport = mse_loss(5*out[2], 5*target3)
+            if epoch < 100:
+                out = net(image1, image2, image3, image4, image5, phase=1)
+            else:
+                out = net(image1, image2, image3, image4, image5, phase=2)
 
-            elif args.pose_type[0] == 'q':
-                loss_rotation = mse_loss(out[0], target1)
-                #loss_rotation = orientation_loss(target1, out[0])
-                loss_transport = mse_loss(out[1], target2)
+            angle_err = 0
+            tran_err = 0
+            target = [target1, target2, target3, target4]
 
+            for i in range(len(out)):
+                rot_pred = quaternion_to_rotation(out[i][:, :4])
+                rot_gt = quaternion_to_rotation(target[i][:, :4])
+                angle_err += rotation_error(rot_pred, rot_gt) / 4
+                tran_err += float(torch.mean(F.pairwise_distance(diff_transport(target[i][:, 4:], args), out[i][:, 4:])).data.cpu()) / 4            # backprop
+
+            loss_rotation, loss_transport = Loss_calculate(out, target)
 
             rot_loss += loss_rotation.data / batch_size  # [0]
             trans_loss += loss_transport.data / batch_size  # [0]
-            if args.pose_type[0] == 'q':
-                rot_err += angle_err / batch_size
-                quat_total_err += quat_err / batch_size
-                trans_err += float(torch.mean(F.pairwise_distance(target2, out[1])).data.cpu()) / batch_size
-            elif args.pose_type[0] == 'd':
-                ang_loss += loss_angle.data / batch_size  # [0]
-                ang_err += angle_err / batch_size
-                rot_err += float(torch.mean(F.pairwise_distance(target1, out[0])).data.cpu()) / batch_size
-                trans_err += float(torch.mean(F.pairwise_distance(target3, out[2])).data.cpu()) / batch_size
+            rot_err += angle_err / batch_size
+            trans_err += tran_err / batch_size
+
         if best_rot > rot_err:
             save_path = os.path.join(args.save_folder,args.net+'_'+args.dataset+'_'+args.pose_type+'_'+args.seven_opt+'_best_rot.pth')
             torch.save(net.state_dict(), save_path)
@@ -297,12 +298,10 @@ def train():
         rot_err = 0
         ang_err = 0
         trans_err = 0
-        quat_err = 0
-        quat_total_err = 0
+
         epoch += 1
         print('best rot err: %f'%(best_rot))
         print('best trans err: %f'%(best_trans))
-        print('best quat err: %f'%(best_quat))
         if args.pose_type[0] == 'd':
             print('best ang err: %f' % (best_ang))
         print('best total err: %f' % (best_total))
@@ -388,8 +387,27 @@ def orientation_loss(quat_t, quat_p, mode='non'):
         LG = 1 - torch.sum(quat_t * scaled_quat_p, 1)
     LN = betta * torch.pow((1 - norm_quat_p), 2)
     loss = torch.mean(LG + LN)
-    return loss
+    return torch.tensor(loss, requires_grad=True).clone().detach().requires_grad_(True)
 
+
+def Loss_calculate(outs, targets):
+    rot_loss_list = []
+    trans_loss_list = []
+
+    for i in range(len(targets)):
+        rot_loss_list.append(#nn.functional.mse_loss(outs[i][:, :4], targets[i][:, :4]) +
+                             #nn.functional.l1_loss(outs[i][:, :4], targets[i][:, :4]) +
+                             orientation_loss(targets[i][:, :4], outs[i][:, :4]))
+        trans_loss_list.append(nn.functional.mse_loss(outs[i][:, 4:], targets[i][:, 4:]) +
+                             nn.functional.l1_loss(outs[i][:, 4:], targets[i][:, 4:]))
+        if i > 1:
+            accu_out = accumulated_quaternion(accu_out, outs[i][:, :4])
+            accu_tar = accumulated_quaternion(accu_tar, targets[i][:, :4])
+        elif i == 1:
+            accu_out = accumulated_quaternion(outs[0][:, :4], outs[1][:, :4])
+            accu_tar = accumulated_quaternion(targets[0][:, :4], targets[1][:, :4])
+    accu_loss = orientation_loss(accu_tar, accu_out)#torch.sum(torch.stack(rot_loss_list,0)) +
+    return torch.sum(torch.stack(rot_loss_list, 0)) + accu_loss, torch.sum(torch.stack(trans_loss_list,0))
 
 if __name__ == '__main__':
     train()
